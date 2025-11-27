@@ -26,19 +26,23 @@ ACCOUNT_FIELDS = ['ID', 'Name', 'Email', 'Account Status']
 
 # --- Integrity Check Function ---
 
-def check_name_integrity(user_rows: list, account_rows: list):
+def check_data_integrity(user_rows: list, account_rows: list):
     """
-    Checks if the 'Name' associated with each 'ID' is consistent 
+    Checks if the 'Name' and 'Email' associated with each 'ID' are consistent 
     between the credit score (user) and account status files.
     """
     
-    # 1. Map all IDs to their names in the User file
-    user_name_map = {}
+    # 1. Map all IDs to their Name and Email in the User file
+    user_data_map = {}
     for row in user_rows:
         try:
-            user_name_map[int(row['ID'])] = row['Name']
+            record_id = int(row['ID'])
+            user_data_map[record_id] = {
+                'Name': row['Name'],
+                'Email': row['Email']
+            }
         except (ValueError, KeyError):
-            continue # Skip invalid rows
+            continue # Skip rows that passed read_all_data but are missing name/email
             
     inconsistencies = []
     
@@ -47,54 +51,69 @@ def check_name_integrity(user_rows: list, account_rows: list):
         try:
             record_id = int(row['ID'])
             account_name = row['Name']
+            account_email = row['Email']
             
-            if record_id in user_name_map:
-                user_name = user_name_map[record_id]
+            if record_id in user_data_map:
+                user_name = user_data_map[record_id]['Name']
+                user_email = user_data_map[record_id]['Email']
                 
-                # Check for Name Mismatch
+                # Check 2A: Name Mismatch
                 if user_name != account_name:
                     inconsistencies.append({
                         'ID': record_id,
-                        'File': ACCOUNT_FILE,
-                        'User Name': user_name,
-                        'Account Name': account_name,
+                        'Field': 'Name',
+                        'User Value': user_name,
+                        'Account Value': account_name,
                         'Issue': 'Name Mismatch'
                     })
+                
+                # Check 2B: Email Mismatch (THE NEW CHECK)
+                if user_email != account_email:
+                    inconsistencies.append({
+                        'ID': record_id,
+                        'Field': 'Email',
+                        'User Value': user_email,
+                        'Account Value': account_email,
+                        'Issue': 'Email Mismatch'
+                    })
+
                 # Remove from map after checking to track unmatched IDs
-                del user_name_map[record_id]
+                del user_data_map[record_id]
                 
         except (ValueError, KeyError):
             continue
             
     # 3. Check for IDs present in User file but missing in Account file
-    for record_id, user_name in user_name_map.items():
+    for record_id, data in user_data_map.items():
          inconsistencies.append({
              'ID': record_id,
-             'File': USER_FILE,
-             'User Name': user_name,
-             'Account Name': 'N/A',
-             'Issue': 'Missing in Account File'
+             'Field': 'ID',
+             'User Value': data['Name'],
+             'Account Value': 'N/A',
+             'Issue': f'Missing match for ID {record_id} in other file.'
          })
          
     if inconsistencies:
-        print("\n❌ NAME INTEGRITY VIOLATION DETECTED ❌")
+        print("\n❌ DATA INTEGRITY VIOLATION DETECTED ❌")
         for item in inconsistencies:
-            print(f"ID: {item['ID']} | Issue: {item['Issue']} | User Name: {item['User Name']} | Account Name: {item['Account Name']}")
-        # In a production environment, you might raise an exception here.
-        # For data generation, we'll just log the warning.
+            print(f"ID: {item['ID']} | Field: {item['Field']} | Issue: {item['Issue']} | User: {item['User Value']} | Account: {item['Account Value']}")
     else:
-        print("✅ Name and ID integrity check passed for existing records.")
+        print("✅ ID, Name, and Email integrity check passed for existing records.")
 
 
 # --- Data Generation and ID Logic ---
 
-def read_all_data(filename: str) -> tuple[list, set]:
-    """Reads all existing data and extracts all existing IDs from a single file."""
+def read_all_data(filename: str) -> tuple[list, set, list]:
+    """
+    Reads all existing data, extracting IDs, and REPORTS invalid rows.
+    Returns: (existing_rows, existing_ids, invalid_rows)
+    """
     existing_rows = []
     existing_ids = set()
+    invalid_rows = [] # New list to store invalid rows
     
     if not os.path.exists(filename):
-        return existing_rows, existing_ids
+        return existing_rows, existing_ids, invalid_rows
     
     try:
         with open(filename, 'r', newline='', encoding='utf-8') as f:
@@ -105,19 +124,25 @@ def read_all_data(filename: str) -> tuple[list, set]:
             reader = csv.DictReader(f)
             
             for row in reader:
+                # Clean up any potential extra empty keys/whitespace
                 row = {k.strip(): v.strip() for k, v in row.items() if k is not None and k.strip() != ''}
                 
                 try:
-                    current_id = int(row['ID'])
+                    # Attempt to read and validate the ID
+                    current_id = int(row.get('ID', ''))
                     existing_ids.add(current_id)
                     existing_rows.append(row)
-                except (ValueError, KeyError):
+                except (ValueError, KeyError) as e:
+                    # Report the row instead of skipping
+                    reason = "Missing ID" if 'ID' not in row else "Non-integer ID"
+                    invalid_rows.append({'file': filename, 'row_data': row, 'reason': reason})
                     continue
             
-    except Exception:
-        pass
+    except Exception as e:
+        # Report file-level errors (e.g., bad file format)
+        print(f"File reading error for {filename}: {e}")
         
-    return existing_rows, existing_ids
+    return existing_rows, existing_ids, invalid_rows
 
 
 def find_new_ids(num_records: int, combined_existing_ids: set) -> list:
@@ -226,11 +251,21 @@ def generate_and_append_datasets(num_records: int):
     
     # --- 1. Read and Calculate IDs for both files (SYNCHRONIZED CHECK) ---
     print("--- Synchronizing and Checking existing data ---")
-    existing_user_rows, user_ids = read_all_data(USER_FILE)
-    existing_account_rows, account_ids = read_all_data(ACCOUNT_FILE)
     
-    # Run the integrity check on the existing data before merging new records
-    check_name_integrity(existing_user_rows, existing_account_rows)
+    # Updated call to read_all_data to capture invalid rows
+    existing_user_rows, user_ids, user_invalid_rows = read_all_data(USER_FILE)
+    existing_account_rows, account_ids, account_invalid_rows = read_all_data(ACCOUNT_FILE)
+    
+    # Report Invalid Rows
+    all_invalid_rows = user_invalid_rows + account_invalid_rows
+    if all_invalid_rows:
+        print(f"\n⚠️ WARNING: {len(all_invalid_rows)} INVALID ROWS DETECTED and SKIPPED ⚠️")
+        for item in all_invalid_rows:
+            # Print a concise representation of the invalid data
+            print(f"File: {item['file']} | Reason: {item['reason']} | Data Sample: {str(item['row_data'])[:100]}...")
+    
+    # Run the integrity check on the *valid* existing data
+    check_data_integrity(existing_user_rows, existing_account_rows)
     
     combined_ids = user_ids.union(account_ids)
     new_ids = find_new_ids(num_records, combined_ids)
