@@ -2,33 +2,89 @@ import csv
 import os
 import sys
 import random
+import re
 from faker import Faker
 from multiprocessing import Pool, cpu_count
+from collections import defaultdict
 
 # --- Configuration ---
-NUM_RECORDS_TO_ADD = 50
+NUM_RECORDS_TO_ADD = 0
 USER_FILE = 'credit_scores.csv'
 ACCOUNT_FILE = 'account_status.csv'
-NUM_PROCESSES = min(2, cpu_count() - 1) if cpu_count() > 1 else 1 
+# Increased processes for better parallel writing of 9k records
+NUM_PROCESSES = min(4, cpu_count() - 1) if cpu_count() > 1 else 1 
 
 fake = Faker('en_UK')
 
 ACCOUNT_STATUSES = ['good-standing', 'delinquent', 'closed']
+REALISTIC_DOMAINS = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'aol.com', 'icloud.com', 'live.com', 'mail.com']
 
-# Required Title Case Headers
-USER_FIELDS = ['ID', 'Name', 'Email', 'Credit_Score']
-ACCOUNT_FIELDS = ['ID', 'Name', 'Email', 'Account_Status']
 
-# --- Key Mapping Functions (Helper functions for cleaner internal processing) ---
+# FIX 1: Corrected Header Mapping (with spaces)
+USER_FIELDS = ['ID', 'Name', 'Email', 'Credit Score']
+ACCOUNT_FIELDS = ['ID', 'Name', 'Email', 'Account Status']
 
-def map_keys_to_title_case(data_dict: dict, fields: list) -> dict:
-    """Converts snake_case keys to Title Case keys for CSV writing."""
-    mapping = {k.lower().replace('_', ''): k for k in fields}
-    title_case_dict = {}
-    for snake_key, value in data_dict.items():
-        if snake_key.lower().replace('_', '') in mapping:
-            title_case_dict[mapping[snake_key.lower().replace('_', '')]] = value
-    return title_case_dict
+# --- Integrity Check Function ---
+
+def check_name_integrity(user_rows: list, account_rows: list):
+    """
+    Checks if the 'Name' associated with each 'ID' is consistent 
+    between the credit score (user) and account status files.
+    """
+    
+    # 1. Map all IDs to their names in the User file
+    user_name_map = {}
+    for row in user_rows:
+        try:
+            user_name_map[int(row['ID'])] = row['Name']
+        except (ValueError, KeyError):
+            continue # Skip invalid rows
+            
+    inconsistencies = []
+    
+    # 2. Check the Account file against the User map
+    for row in account_rows:
+        try:
+            record_id = int(row['ID'])
+            account_name = row['Name']
+            
+            if record_id in user_name_map:
+                user_name = user_name_map[record_id]
+                
+                # Check for Name Mismatch
+                if user_name != account_name:
+                    inconsistencies.append({
+                        'ID': record_id,
+                        'File': ACCOUNT_FILE,
+                        'User Name': user_name,
+                        'Account Name': account_name,
+                        'Issue': 'Name Mismatch'
+                    })
+                # Remove from map after checking to track unmatched IDs
+                del user_name_map[record_id]
+                
+        except (ValueError, KeyError):
+            continue
+            
+    # 3. Check for IDs present in User file but missing in Account file
+    for record_id, user_name in user_name_map.items():
+         inconsistencies.append({
+             'ID': record_id,
+             'File': USER_FILE,
+             'User Name': user_name,
+             'Account Name': 'N/A',
+             'Issue': 'Missing in Account File'
+         })
+         
+    if inconsistencies:
+        print("\n❌ NAME INTEGRITY VIOLATION DETECTED ❌")
+        for item in inconsistencies:
+            print(f"ID: {item['ID']} | Issue: {item['Issue']} | User Name: {item['User Name']} | Account Name: {item['Account Name']}")
+        # In a production environment, you might raise an exception here.
+        # For data generation, we'll just log the warning.
+    else:
+        print("✅ Name and ID integrity check passed for existing records.")
+
 
 # --- Data Generation and ID Logic ---
 
@@ -41,24 +97,24 @@ def read_all_data(filename: str) -> tuple[list, set]:
         return existing_rows, existing_ids
     
     try:
-        # Use open() with explicit newline='' to fix potential ^M (CR) issues
         with open(filename, 'r', newline='', encoding='utf-8') as f:
+            header = f.readline().strip()
+            cleaned_header = re.sub(r',+$', '', header) 
+            f.seek(0)
+            
             reader = csv.DictReader(f)
-            id_field = 'ID' 
             
             for row in reader:
-                # Clean up any potential extra empty keys/whitespace
-                row = {k: v.strip() for k, v in row.items() if k is not None and k.strip() != ''}
+                row = {k.strip(): v.strip() for k, v in row.items() if k is not None and k.strip() != ''}
                 
                 try:
-                    current_id = int(row[id_field])
+                    current_id = int(row['ID'])
                     existing_ids.add(current_id)
                     existing_rows.append(row)
                 except (ValueError, KeyError):
                     continue
             
     except Exception:
-        # Silently fail if file is unreadable, assuming it's empty
         pass
         
     return existing_rows, existing_ids
@@ -72,13 +128,9 @@ def find_new_ids(num_records: int, combined_existing_ids: set) -> list:
 
     max_id = max(combined_existing_ids)
     
-    # 1. Find all gap IDs up to the current max ID
     gap_ids = [i for i in range(1, max_id) if i not in combined_existing_ids]
-    
-    # 2. Determine the sequence of new IDs: gaps first
     new_ids = gap_ids[:num_records]
     
-    # 3. If we still need more records, use sequential IDs
     if len(new_ids) < num_records:
         start_sequential = max_id + 1
         num_sequential = num_records - len(new_ids)
@@ -88,7 +140,7 @@ def find_new_ids(num_records: int, combined_existing_ids: set) -> list:
     return new_ids
 
 
-def generate_new_rows(num_records: int, new_ids: list, user_fields: list, account_fields: list) -> tuple[list, list]:
+def generate_new_rows(num_records: int, new_ids: list) -> tuple[list, list]:
     """Generates user and account rows using the pre-determined sorted IDs."""
     
     user_rows = []
@@ -98,31 +150,39 @@ def generate_new_rows(num_records: int, new_ids: list, user_fields: list, accoun
     
     for i, record_id in enumerate(new_ids):
         
-        if (i + 1) % 10 == 0 or (i + 1) == num_records:
+        if (i + 1) % 1000 == 0 or (i + 1) == num_records: # Updated progress bar increment
             sys.stdout.write(f'\rProgress: {i + 1}/{num_records} records generated...')
             sys.stdout.flush() 
         
-        # Creative Email Generation (using format: first.last_ID@random-domain.co.uk)
+        # Realistic Email Format
         name_parts = fake.name().split()
         first_name = name_parts[0].lower()
-        last_name = name_parts[-1].lower() if len(name_parts) > 1 else "user"
         
-        user_name_title = f"{first_name.title()} {last_name.title()}"
-        user_email = f"{first_name}.{last_name}_{record_id}@{fake.domain_name()}"
+        local_part_options = [
+            first_name,
+            f"{first_name}{random.randint(10, 99)}",
+            f"{first_name}.{name_parts[-1].lower()}" if len(name_parts) > 1 else first_name,
+            fake.user_name()
+        ]
+        local_part = random.choice(local_part_options)
         
-        # Data creation using Title Case keys
+        user_name_title = " ".join(part.title() for part in name_parts)
+        domain = random.choice(REALISTIC_DOMAINS)
+        user_email = f"{local_part}@{domain}"
+        
+        # --- Critical: Generate BOTH rows using the IDENTICAL Name ---
         user_data = {
             'ID': record_id,
-            'Name': user_name_title,
+            'Name': user_name_title, # The canonical Name
             'Email': user_email,
-            'Credit_Score': random.randint(300, 850)
+            'Credit Score': random.randint(300, 850)
         }
         
         account_data = {
             'ID': record_id, 
-            'Name': user_name_title,
+            'Name': user_name_title, # The canonical Name (must match user_data)
             'Email': user_email,
-            'Account_Status': fake.random_element(ACCOUNT_STATUSES)
+            'Account Status': fake.random_element(ACCOUNT_STATUSES)
         }
         
         user_rows.append(user_data)
@@ -137,10 +197,8 @@ def rewrite_csv_task(args):
     """Worker function for multiprocessing pool to REWRITE and sort a single file."""
     filename, fieldnames, all_rows = args
     
-    # 1. Sort ALL rows (existing + new) by the ID column (Crucial Step!)
     all_rows.sort(key=lambda row: int(row['ID']))
     
-    # 2. Open in 'w' (write/overwrite) mode
     with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         
@@ -166,19 +224,20 @@ def rewrite_csv_parallel(file_data_list):
 
 def generate_and_append_datasets(num_records: int):
     
-    # --- 1. Read and Calculate IDs for both files (THE FIX) ---
+    # --- 1. Read and Calculate IDs for both files (SYNCHRONIZED CHECK) ---
+    print("--- Synchronizing and Checking existing data ---")
     existing_user_rows, user_ids = read_all_data(USER_FILE)
     existing_account_rows, account_ids = read_all_data(ACCOUNT_FILE)
     
-    # MERGE IDs: This ensures the generated IDs are unique across BOTH files.
-    combined_ids = user_ids.union(account_ids)
+    # Run the integrity check on the existing data before merging new records
+    check_name_integrity(existing_user_rows, existing_account_rows)
     
-    # Calculate new IDs based on the combined set
+    combined_ids = user_ids.union(account_ids)
     new_ids = find_new_ids(num_records, combined_ids)
     
     # --- 2. Generate new rows ---
     new_user_rows, new_account_rows = generate_new_rows(
-        num_records, new_ids, USER_FIELDS, ACCOUNT_FIELDS
+        num_records, new_ids
     )
 
     # --- 3. Combine and Prepare for Rewrite ---
@@ -195,7 +254,7 @@ def generate_and_append_datasets(num_records: int):
     rewrite_csv_parallel(file_data_list)
 
     print(f"\n--- Generation Summary ---")
-    print(f"Added {num_records} denormalized records.")
+    print(f"Added {len(new_ids)} denormalized records.")
     print(f"Files are now fully sorted by ID, and IDs are synchronized.")
 
 
