@@ -11,6 +11,7 @@ from collections import defaultdict
 NUM_RECORDS_TO_ADD = 0
 USER_FILE = 'credit_scores.csv'
 ACCOUNT_FILE = 'account_status.csv'
+CHUNK_SIZE = 100
 # Increased processes for better parallel writing of 9k records
 NUM_PROCESSES = min(4, cpu_count() - 1) if cpu_count() > 1 else 1 
 
@@ -23,6 +24,52 @@ REALISTIC_DOMAINS = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'ao
 # FIX 1: Corrected Header Mapping (with spaces)
 USER_FIELDS = ['ID', 'Name', 'Email', 'Credit Score']
 ACCOUNT_FIELDS = ['ID', 'Name', 'Email', 'Account Status']
+
+CLEAN_USER_FILE = 'credit_scores_clean.csv'
+CLEAN_ACCOUNT_FILE = 'account_status_clean.csv'
+CLEAN_USER_FIELDS = ['Name', 'Credit Score']
+CLEAN_ACCOUNT_FIELDS = ['Name', 'Account Status']
+
+def write_clean_csv(base_filename: str, clean_fieldnames: list, all_rows: list):
+    """
+    Writes data to multiple clean CSV files, splitting the total dataset
+    into chunks of CHUNK_SIZE (100 rows).
+    """
+    total_records = len(all_rows)
+    CHUNK_SIZE = 100 # Define the chunk size inside the function or use the constant
+
+    print(f"Starting to write {total_records} records to multiple files (Chunk Size: {CHUNK_SIZE})...")
+    
+    # 1. Loop through all_rows in steps of CHUNK_SIZE
+    for i in range(0, total_records, CHUNK_SIZE):
+        
+        # Determine the start and end indices for the current chunk
+        chunk = all_rows[i:i + CHUNK_SIZE]
+        
+        # Determine the file index (1-based) and construct the unique filename
+        file_index = (i // CHUNK_SIZE) + 1
+        
+        # Example: 'credit_scores_clean.csv' -> 'credit_scores_clean_part_1.csv'
+        filename, extension = os.path.splitext(base_filename)
+        output_filename = f"{filename}_part_{file_index}{extension}"
+        
+        try:
+            with open(output_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(
+                    csvfile, 
+                    fieldnames=clean_fieldnames,
+                    extrasaction='ignore' # Ensures 'ID' and 'Email' are ignored
+                )
+                
+                writer.writeheader()
+                writer.writerows(chunk)
+            
+            print(f"  -> Wrote {len(chunk)} records to **{output_filename}**")
+            
+        except Exception as e:
+            print(f"Error writing chunk file {output_filename}: {e}")
+
+    print(f"✅ Finished writing all clean CSV chunks based on **{base_filename}**.")
 
 # --- Integrity Check Function ---
 
@@ -287,6 +334,10 @@ def generate_and_append_datasets(num_records: int):
     
     # --- 4. Rewrite and Sort in Parallel ---
     rewrite_csv_parallel(file_data_list)
+
+    print("\n--- Generating Clean CSV Files (Name and Data Field, chunks of 100) ---")
+    write_clean_csv(CLEAN_USER_FILE, CLEAN_USER_FIELDS, all_user_rows)
+    write_clean_csv(CLEAN_ACCOUNT_FILE, CLEAN_ACCOUNT_FIELDS, all_account_rows)
 
     print(f"\n--- Generation Summary ---")
     print(f"Added {len(new_ids)} denormalized records.")
